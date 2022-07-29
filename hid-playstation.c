@@ -173,6 +173,11 @@ struct dualsense {
 	uint8_t player_leds_state;
 	struct led_classdev player_leds[5];
 
+	/* Adaptive Triggers */
+	bool update_triggers;
+	uint8_t trigger_mode;
+	uint8_t trigger_force[8];
+
 	struct work_struct output_worker;
 	void *output_report_dmabuf;
 	uint8_t output_seq; /* Sequence number for output report. */
@@ -702,6 +707,81 @@ static const struct attribute_group ps_device_attribute_group = {
 	.attrs = ps_device_attributes,
 };
 
+/* JOTZ */
+static ssize_t atrigger_show(struct device *dev,
+			struct device_attribute *attr,
+			char *buf)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct ps_device *ps_dev = hid_get_drvdata(hdev);
+	struct dualsense *ds = container_of(ps_dev, struct dualsense, base);
+	unsigned long flags;
+	ssize_t ret;
+
+	spin_lock_irqsave(&ps_dev->lock, flags);
+	ret = sysfs_emit(buf, "%d %d %d %d %d %d %d %d %d\n",
+			ds->trigger_mode,
+			ds->trigger_force[0],
+			ds->trigger_force[1],
+			ds->trigger_force[2],
+			ds->trigger_force[3],
+			ds->trigger_force[4],
+			ds->trigger_force[5],
+			ds->trigger_force[6],
+			ds->trigger_force[7]);
+	spin_unlock_irqrestore(&ps_dev->lock, flags);
+	
+	return ret;
+}
+
+static ssize_t atrigger_store(struct device *dev,
+			struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+	struct hid_device *hdev = to_hid_device(dev);
+	struct ps_device *ps_dev = hid_get_drvdata(hdev);
+	struct dualsense *ds = container_of(ps_dev, struct dualsense, base);
+	unsigned long flags;
+
+	unsigned int tmp[9], i;
+	int read = sscanf(buf, "%u %u %u %u %u %u %u %u %u",
+			&tmp[0], &tmp[1], &tmp[2], &tmp[3], &tmp[4],
+			&tmp[5], &tmp[6], &tmp[7], &tmp[8]);
+
+	if (read <= 0)
+		return count;
+
+	for (i = 0; i < read; i++) {
+		if (tmp[i] > 255)
+			tmp[i] = 255;
+	}
+
+	spin_lock_irqsave(&ps_dev->lock, flags);
+	ds->update_triggers = true;
+	ds->trigger_mode = tmp[0];
+	for (i = 1; i < read; i++) {
+		ds->trigger_force[i - 1] = tmp[i];
+	}
+	spin_unlock_irqrestore(&ps_dev->lock, flags);
+
+	schedule_work(&ds->output_worker);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(atrigger);
+
+static struct attribute *dualsense_attributes[] = {
+	&dev_attr_atrigger.attr,
+	NULL
+};
+
+static const struct attribute_group dualsense_attribute_group = {
+	.attrs = dualsense_attributes,
+};
+
+/* ------------ */
+
 static int dualsense_get_calibration_data(struct dualsense *ds)
 {
 	short gyro_pitch_bias, gyro_pitch_plus, gyro_pitch_minus;
@@ -1000,6 +1080,11 @@ static void dualsense_output_worker(struct work_struct *work)
 		}
 
 		ds->update_mic_mute = false;
+	}
+
+	if (ds->update_triggers) {
+		// TODO
+		ds->update_triggers = false;
 	}
 
 	spin_unlock_irqrestore(&ds->base.lock, flags);
@@ -1452,6 +1537,14 @@ static int ps_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	if (ret) {
 		hid_err(hdev, "Failed to register sysfs nodes.\n");
 		goto err_close;
+	}
+
+	if (hdev->product == USB_DEVICE_ID_SONY_PS5_CONTROLLER) {
+		ret = devm_device_add_group(&hdev->dev, &dualsense_attribute_group);
+		if (ret) {
+			hid_err(hdev, "Failed to register sysfs nodes (dualsense).\n");
+			goto err_close;
+		}
 	}
 
 	return ret;
