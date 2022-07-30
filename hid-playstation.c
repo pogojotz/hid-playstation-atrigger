@@ -119,6 +119,8 @@ struct ps_led_info {
 /* Flags for DualSense output report. */
 #define DS_OUTPUT_VALID_FLAG0_COMPATIBLE_VIBRATION BIT(0)
 #define DS_OUTPUT_VALID_FLAG0_HAPTICS_SELECT BIT(1)
+#define DS_OUTPUT_VALID_FLAG0_RIGHT_ATRIGGER_ENABLE BIT(2)
+#define DS_OUTPUT_VALID_FLAG0_LEFT_ATRIGGER_ENABLE BIT(3)
 #define DS_OUTPUT_VALID_FLAG1_MIC_MUTE_LED_CONTROL_ENABLE BIT(0)
 #define DS_OUTPUT_VALID_FLAG1_POWER_SAVE_CONTROL_ENABLE BIT(1)
 #define DS_OUTPUT_VALID_FLAG1_LIGHTBAR_CONTROL_ENABLE BIT(2)
@@ -175,8 +177,10 @@ struct dualsense {
 
 	/* Adaptive Triggers */
 	bool update_triggers;
-	uint8_t trigger_mode;
-	uint8_t trigger_force[8];
+	uint8_t right_atrigger_mode;
+	uint8_t right_atrigger_params[10];
+	uint8_t left_atrigger_mode;
+	uint8_t left_atrigger_params[10];
 
 	struct work_struct output_worker;
 	void *output_report_dmabuf;
@@ -230,7 +234,15 @@ struct dualsense_output_report_common {
 	uint8_t mute_button_led;
 
 	uint8_t power_save_control;
-	uint8_t reserved2[28];
+	//uint8_t reserved2[28];
+
+	/* Adaptive Triggers */
+	uint8_t right_atrigger_mode;
+	uint8_t right_atrigger_params[10];
+	uint8_t left_atrigger_mode;
+	uint8_t left_atrigger_params[10];
+
+	uint8_t reserved2[6];
 
 	/* LEDs and lightbar */
 	uint8_t valid_flag2;
@@ -710,6 +722,15 @@ static const struct attribute_group ps_device_attribute_group = {
 /* JOTZ */
 static ssize_t atrigger_show(struct device *dev,
 			struct device_attribute *attr,
+			char *buf);
+static ssize_t atrigger_store(struct device *dev,
+		struct device_attribute *attr,
+		const char *buf, size_t count);
+static DEVICE_ATTR(right_atrigger, 0644, atrigger_show, atrigger_store);
+static DEVICE_ATTR(left_atrigger, 0644, atrigger_show, atrigger_store);
+
+static ssize_t atrigger_show(struct device *dev,
+			struct device_attribute *attr,
 			char *buf)
 {
 	struct hid_device *hdev = to_hid_device(dev);
@@ -718,49 +739,70 @@ static ssize_t atrigger_show(struct device *dev,
 	unsigned long flags;
 	ssize_t ret;
 
+	uint8_t *mode, *params;
+	if (attr == &dev_attr_right_atrigger) {
+		mode = &ds->right_atrigger_mode;
+		params = ds->right_atrigger_params;
+	} else {
+		mode = &ds->left_atrigger_mode;
+		params = ds->left_atrigger_params;
+	}
+
 	spin_lock_irqsave(&ps_dev->lock, flags);
-	ret = sysfs_emit(buf, "%d %d %d %d %d %d %d %d %d\n",
-			ds->trigger_mode,
-			ds->trigger_force[0],
-			ds->trigger_force[1],
-			ds->trigger_force[2],
-			ds->trigger_force[3],
-			ds->trigger_force[4],
-			ds->trigger_force[5],
-			ds->trigger_force[6],
-			ds->trigger_force[7]);
+	ret = sysfs_emit(buf, "%d %d %d %d %d %d %d %d %d %d %d\n",
+			*mode, params[0], params[1], params[2],
+			params[3], params[4], params[5], params[6],
+			params[7], params[8], params[9]);
 	spin_unlock_irqrestore(&ps_dev->lock, flags);
-	
+
 	return ret;
 }
 
+static int parse_atrigger_params(uint params[11], const char *buf)
+{
+	int i;
+	int read = sscanf(buf, "%u %u %u %u %u %u %u %u %u %u %u",
+			&params[0], &params[1], &params[2], &params[3],
+			&params[4], &params[5], &params[6], &params[7],
+			&params[8], &params[9], &params[10]);
+
+	if (read <= 0)
+		return 0;
+
+	for (i = 0; i < read; i++) {
+		if (params[i] > 255)
+			params[i] = 255;
+	}
+	return read;
+}
+
 static ssize_t atrigger_store(struct device *dev,
-			struct device_attribute *attr,
-			const char *buf, size_t count)
+		struct device_attribute *attr,
+		const char *buf, size_t count)
 {
 	struct hid_device *hdev = to_hid_device(dev);
 	struct ps_device *ps_dev = hid_get_drvdata(hdev);
 	struct dualsense *ds = container_of(ps_dev, struct dualsense, base);
 	unsigned long flags;
+	int i;
 
-	unsigned int tmp[9], i;
-	int read = sscanf(buf, "%u %u %u %u %u %u %u %u %u",
-			&tmp[0], &tmp[1], &tmp[2], &tmp[3], &tmp[4],
-			&tmp[5], &tmp[6], &tmp[7], &tmp[8]);
+	uint tmp[11];
+	int read = parse_atrigger_params(tmp, buf);
 
-	if (read <= 0)
-		return count;
-
-	for (i = 0; i < read; i++) {
-		if (tmp[i] > 255)
-			tmp[i] = 255;
+	uint8_t *mode, *params;
+	if (attr == &dev_attr_right_atrigger) {
+		mode = &ds->right_atrigger_mode;
+		params = ds->right_atrigger_params;
+	} else {
+		mode = &ds->left_atrigger_mode;
+		params = ds->left_atrigger_params;
 	}
 
 	spin_lock_irqsave(&ps_dev->lock, flags);
 	ds->update_triggers = true;
-	ds->trigger_mode = tmp[0];
+	*mode = tmp[0];
 	for (i = 1; i < read; i++) {
-		ds->trigger_force[i - 1] = tmp[i];
+		params[i - 1] = tmp[i];
 	}
 	spin_unlock_irqrestore(&ps_dev->lock, flags);
 
@@ -769,10 +811,9 @@ static ssize_t atrigger_store(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR_RW(atrigger);
-
 static struct attribute *dualsense_attributes[] = {
-	&dev_attr_atrigger.attr,
+	&dev_attr_right_atrigger.attr,
+	&dev_attr_left_atrigger.attr,
 	NULL
 };
 
@@ -1083,7 +1124,16 @@ static void dualsense_output_worker(struct work_struct *work)
 	}
 
 	if (ds->update_triggers) {
-		// TODO
+		int i;
+		common->valid_flag0 |= DS_OUTPUT_VALID_FLAG0_RIGHT_ATRIGGER_ENABLE;
+		common->valid_flag0 |= DS_OUTPUT_VALID_FLAG0_LEFT_ATRIGGER_ENABLE;
+
+		common->right_atrigger_mode = ds->right_atrigger_mode;
+		common->left_atrigger_mode = ds->left_atrigger_mode;
+		for (i = 0; i < 10; i++) {
+			common->right_atrigger_params[i] = ds->right_atrigger_params[i];
+			common->left_atrigger_params[i] = ds->left_atrigger_params[i];
+		}
 		ds->update_triggers = false;
 	}
 
